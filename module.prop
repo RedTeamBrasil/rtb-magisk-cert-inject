@@ -1,6 +1,6 @@
 id=cert-inject
-name=Cert Inject
+name=RTB Cert Inject
 version=v1.2
-versionCode=3
-author=nunes
+versionCode=4
+author=Nunes
 description=Injects user-installed CA certificates into the Android 14/15 trust stores. Normalizes PEM/DER, writes both subject_hash (SHA-1, BoringSSL/Dart) and subject_hash_old (MD5, Conscrypt/Java), and populates /apex/com.android.conscrypt/cacerts and /system/etc/security/cacerts.
