@@ -1,0 +1,174 @@
+name: Release
+
+# Publica o zip na seção "Releases" do GitHub.
+#
+# Dispara de duas formas:
+#   1. push de uma tag v*  ->  git tag v1.2 && git push origin v1.2
+#   2. manual (Actions -> Release -> Run workflow), informando a tag
+#
+# O workflow compila o helper para arm64/armv7/x86_64, roda o self-test contra
+# o OpenSSL do runner, valida o zip e cria o Release com o .zip + .sha256.
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag a publicar (deve ser igual ao version= do module.prop, ex.: v1.2)'
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: false
+
+      - name: Toolchain
+        run: |
+          go version
+          openssl version
+          zip -v | head -1
+          unzip -v | head -1
+
+      - name: Resolve tag
+        id: tag
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          INPUT_TAG: ${{ inputs.tag }}
+        run: |
+          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+            tag="$INPUT_TAG"
+          else
+            tag="${GITHUB_REF_NAME}"
+          fi
+          case "$tag" in
+            v*) ;;
+            *) echo "::error::a tag deve começar com v (recebido: '$tag')"; exit 1 ;;
+          esac
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+
+      - name: Build and self-test
+        run: |
+          chmod +x build.sh
+          ./build.sh
+
+      - name: Validate version and artifact
+        id: meta
+        env:
+          TAG: ${{ steps.tag.outputs.tag }}
+        run: |
+          version=$(sed -n 's/^version=//p' module.prop)
+          code=$(sed -n 's/^versionCode=//p' module.prop)
+          if [ "$TAG" != "$version" ]; then
+            echo "::error::tag '$TAG' != module.prop version '$version'"
+            exit 1
+          fi
+          zip="dist/cert-inject-${version}.zip"
+          test -f "$zip" || { echo "::error::missing $zip"; exit 1; }
+          # Extrai para arquivos antes de checar: `unzip -p | grep -q` fecha o pipe
+          # cedo e, com o pipefail padrão do runner, o unzip morre com SIGPIPE (141).
+          work="$RUNNER_TEMP/zipcheck"
+          rm -rf "$work" && mkdir -p "$work"
+          unzip -q "$zip" -d "$work"
+          test -f "$work/module.prop"
+          test -f "$work/META-INF/com/google/android/update-binary"
+          grep -qx "version=$version" "$work/module.prop"
+          grep -q 'unmount_file' "$work/lib.sh"
+          grep -q 'nsenter' "$work/service.sh"
+          magic=$(od -An -tx1 -N4 "$work/bin/certinject-arm64" | tr -d ' \n')
+          test "$magic" = "7f454c46" || { echo "::error::helper arm64 não é um ELF"; exit 1; }
+          sha256sum "$zip" > "$zip.sha256"
+          cat "$zip.sha256"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "code=$code" >> "$GITHUB_OUTPUT"
+          echo "zip=$zip" >> "$GITHUB_OUTPUT"
+
+      - name: Build release notes
+        env:
+          VERSION: ${{ steps.meta.outputs.version }}
+          CODE: ${{ steps.meta.outputs.code }}
+          ZIP: ${{ steps.meta.outputs.zip }}
+        run: |
+          sha=$(sha256sum "$ZIP" | cut -d' ' -f1)
+          cat > release-notes.md <<'EOF'
+          ## Cert Inject __VERSION__
+
+          Módulo Magisk que injeta CAs instaladas pelo usuário nos trust stores do Android 14/15,
+          gravando **os dois nomes** que as stacks TLS procuram:
+
+          | Stack | Hash | Arquivo |
+          |---|---|---|
+          | BoringSSL / libflutter (Dart, nativo) | `subject_hash` (SHA-1 do subject canônico) | `<sha1>.0` |
+          | Conscrypt / Java (OkHttp, SDKs) | `subject_hash_old` (MD5 do subject DER) | `<md5>.0` |
+
+          ### Instalar
+
+          ```sh
+          adb push __ZIP__ /data/local/tmp/
+          adb shell su -c 'magisk --install-module /data/local/tmp/__ZIP__'
+          # se o cert-fixer estiver instalado, desative-o antes do reboot:
+          adb shell su -c 'touch /data/adb/modules/cert-fixer/disable'
+          adb reboot
+          ```
+
+          ### Verificar
+
+          ```sh
+          adb shell su -c 'cat /data/adb/cert-inject/inject.log'
+          adb shell su -c 'ls /apex/com.android.conscrypt/cacerts'
+          adb shell su -c 'ls /system/etc/security/cacerts'
+          ```
+
+          **SHA-256:** `__SHA__`
+
+          **versionCode:** `__CODE__`
+          EOF
+          sed -i \
+            -e "s/__VERSION__/${VERSION}/g" \
+            -e "s/__CODE__/${CODE}/g" \
+            -e "s/__ZIP__/${ZIP##*/}/g" \
+            -e "s/__SHA__/${sha}/g" \
+            release-notes.md
+          cat release-notes.md
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: cert-inject-${{ steps.meta.outputs.version }}
+          path: |
+            ${{ steps.meta.outputs.zip }}
+            ${{ steps.meta.outputs.zip }}.sha256
+          if-no-files-found: error
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.tag.outputs.tag }}
+          name: Cert Inject ${{ steps.meta.outputs.version }}
+          body_path: release-notes.md
+          files: |
+            ${{ steps.meta.outputs.zip }}
+            ${{ steps.meta.outputs.zip }}.sha256
+          draft: false
+          prerelease: false
+          generate_release_notes: false
+          fail_on_unmatched_files: true

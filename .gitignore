@@ -1,0 +1,20 @@
+# Build outputs — o zip é publicado em Releases, não versionado.
+/dist/
+/bin/
+*.zip
+*.sha256
+
+# macOS
+.DS_Store
+
+# Segredos e fixtures locais (nunca commitar)
+*.pfx
+*.p12
+*.key
+*.jks
+*.pem
+*.cer
+
+# Editores
+.idea/
+.vscode/

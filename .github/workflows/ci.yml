@@ -1,0 +1,68 @@
+name: CI
+
+# Build + self-test em todo push/PR que mexe no módulo. Não publica Release;
+# serve para pegar regressão no helper, nos scripts ou no empacotamento antes
+# de você criar a tag.
+
+on:
+  push:
+    branches: [main, master]
+    paths:
+      - 'src/**'
+      - '*.sh'
+      - 'module.prop'
+      - 'META-INF/**'
+      - 'go.mod'
+      - '.github/workflows/**'
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: false
+
+      - name: Shell syntax
+        run: |
+          for f in lib.sh post-fs-data.sh service.sh customize.sh uninstall.sh; do
+            sh -n "$f"
+          done
+
+      - name: Build and self-test
+        run: |
+          chmod +x build.sh
+          ./build.sh
+
+      - name: Validate artifact
+        run: |
+          version=$(sed -n 's/^version=//p' module.prop)
+          zip="dist/cert-inject-${version}.zip"
+          test -f "$zip" || { echo "::error::missing $zip"; exit 1; }
+          work="$RUNNER_TEMP/zipcheck"
+          rm -rf "$work" && mkdir -p "$work"
+          unzip -q "$zip" -d "$work"
+          test -f "$work/module.prop"
+          test -f "$work/META-INF/com/google/android/update-binary"
+          grep -q 'unmount_file' "$work/lib.sh"
+          grep -q 'nsenter' "$work/service.sh"
+          for f in "$work"/bin/certinject-*; do
+            test "$(od -An -tx1 -N4 "$f" | tr -d ' \n')" = "7f454c46" || { echo "::error::$f não é ELF"; exit 1; }
+          done
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: cert-inject-build
+          path: dist/*.zip
+          if-no-files-found: error
